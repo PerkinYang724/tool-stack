@@ -3,6 +3,7 @@ import {
   Search, X, Plus, ExternalLink, Clock, Users,
   TrendingUp, Copy, Trash2, Check, ArrowUpDown, Filter,
 } from 'lucide-react'
+import { supabase } from './src/supabase.js'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const CATEGORIES = ['AI', 'Productivity', 'Design', 'Dev', 'Outreach', 'Finance', 'Marketing', 'Ops']
@@ -866,16 +867,23 @@ function SubmitModal({ founders, onClose, onSave }) {
   )
 }
 
+// ── DB helpers ────────────────────────────────────────────────────────────────
+const dbToJs = row => ({
+  id:        row.id,
+  name:      row.name,
+  role:      row.role,
+  company:   row.company,
+  tools:     row.tools,
+  updatedAt: row.updated_at,
+})
+
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
   const urlState = readUrl()
 
-  const [founders, setFounders] = useState(() => {
-    try {
-      const stored = localStorage.getItem('toolstack_founders')
-      return stored ? JSON.parse(stored) : SEED_FOUNDERS
-    } catch { return SEED_FOUNDERS }
-  })
+  const [founders,  setFounders]  = useState([])
+  const [loading,   setLoading]   = useState(true)
+  const [dbError,   setDbError]   = useState(null)
 
   const [search,           setSearch]           = useState(urlState.search)
   const [activeCategories, setActiveCategories] = useState(urlState.categories)
@@ -885,10 +893,8 @@ export default function App() {
   const [showModal,        setShowModal]        = useState(false)
   const [gridVisible,      setGridVisible]      = useState(true)
 
-  // Resolve activeTool from URL on mount + keep as object
   const [activeTool, setActiveTool] = useState(() => {
     if (!urlState.toolName) return null
-    // Try to find tool object from seed data
     for (const f of SEED_FOUNDERS) {
       const t = f.tools.find(t => t.name.toLowerCase() === urlState.toolName.toLowerCase())
       if (t) return t
@@ -896,10 +902,39 @@ export default function App() {
     return { name: urlState.toolName, category: 'AI', url: '' }
   })
 
-  // Persist founders
+  // Fetch all founders; seed DB on first load if empty
+  async function fetchFounders() {
+    const { data, error } = await supabase
+      .from('founders')
+      .select('*')
+      .order('updated_at', { ascending: false })
+
+    if (error) { setDbError(error.message); setLoading(false); return }
+
+    if (data.length === 0) {
+      const seed = SEED_FOUNDERS.map(f => ({
+        id: f.id, name: f.name, role: f.role, company: f.company,
+        tools: f.tools, updated_at: f.updatedAt,
+      }))
+      await supabase.from('founders').insert(seed)
+      setFounders(SEED_FOUNDERS)
+    } else {
+      setFounders(data.map(dbToJs))
+    }
+    setLoading(false)
+  }
+
+  // Initial fetch + real-time subscription
   useEffect(() => {
-    localStorage.setItem('toolstack_founders', JSON.stringify(founders))
-  }, [founders])
+    fetchFounders()
+
+    const channel = supabase
+      .channel('founders-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'founders' }, fetchFounders)
+      .subscribe()
+
+    return () => supabase.removeChannel(channel)
+  }, [])
 
   // Sync URL
   useEffect(() => {
@@ -916,7 +951,6 @@ export default function App() {
   // Derived: filtered + sorted founders
   const filteredFounders = useMemo(() => {
     let results = founders.filter(f => {
-      // Category filter
       if (activeCategories.length > 0) {
         const cats = new Set(f.tools.map(t => t.category))
         const match = filterMode === 'and'
@@ -924,24 +958,18 @@ export default function App() {
           : activeCategories.some(c => cats.has(c))
         if (!match) return false
       }
-      // Tool chip filter
       if (activeTool) {
         if (!f.tools.some(t => t.name.toLowerCase() === activeTool.name.toLowerCase())) return false
       }
-      // Role filter
       if (activeRole && f.role !== activeRole) return false
-      // Search
       if (search.trim() && founderScore(f, search) === 0) return false
       return true
     })
 
-    // Sort
     if (sort === 'recent')     results = [...results].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
     if (sort === 'oldest')     results = [...results].sort((a, b) => new Date(a.updatedAt) - new Date(b.updatedAt))
     if (sort === 'most-tools') results = [...results].sort((a, b) => b.tools.length - a.tools.length)
     if (sort === 'az')         results = [...results].sort((a, b) => a.name.localeCompare(b.name))
-
-    // If search active, also sort by relevance score descending
     if (search.trim() && sort === 'recent') {
       results = [...results].sort((a, b) => founderScore(b, search) - founderScore(a, search))
     }
@@ -957,21 +985,27 @@ export default function App() {
   const handleToolClick = tool =>
     setActiveTool(prev => prev?.name.toLowerCase() === tool.name.toLowerCase() ? null : tool)
 
-  const handleDelete = id =>
+  const handleDelete = async id => {
     setFounders(prev => prev.filter(f => f.id !== id))
+    await supabase.from('founders').delete().eq('id', id)
+  }
 
-  const handleSave = ({ name, company, role, tools }) => {
+  const handleSave = async ({ name, company, role, tools }) => {
+    const existing = founders.find(f => f.name.toLowerCase() === name.toLowerCase())
+    const entry = {
+      id:         existing?.id || uid(),
+      name, company, role, tools,
+      updated_at: new Date().toISOString(),
+    }
+    // Optimistic update
     setFounders(prev => {
       const idx = prev.findIndex(f => f.name.toLowerCase() === name.toLowerCase())
-      const entry = {
-        id:        idx >= 0 ? prev[idx].id : uid(),
-        name, company, role, tools,
-        updatedAt: new Date().toISOString(),
-      }
-      if (idx >= 0) return prev.map((f, i) => i === idx ? entry : f)
-      return [entry, ...prev]
+      const mapped = dbToJs(entry)
+      if (idx >= 0) return prev.map((f, i) => i === idx ? mapped : f)
+      return [mapped, ...prev]
     })
     setShowModal(false)
+    await supabase.from('founders').upsert(entry)
   }
 
   const clearAll = () => {
@@ -983,6 +1017,12 @@ export default function App() {
   }
 
   const hasFilters = activeCategories.length > 0 || search || activeTool || activeRole
+
+  if (dbError) return (
+    <div className="min-h-screen bg-[#0A0A0F] flex items-center justify-center">
+      <p className="text-red-400 font-mono text-sm">DB error: {dbError}</p>
+    </div>
+  )
 
   return (
     <>
@@ -1065,26 +1105,32 @@ export default function App() {
           )}
 
           {/* Grid */}
-          <div
-            className={`
-              grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4
-              transition-all duration-200
-              ${gridVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-1'}
-            `}
-          >
-            {filteredFounders.length === 0
-              ? <EmptyState onSubmit={() => setShowModal(true)} />
-              : filteredFounders.map(f => (
-                <FounderCard
-                  key={f.id}
-                  founder={f}
-                  activeTool={activeTool}
-                  onToolClick={handleToolClick}
-                  onDelete={handleDelete}
-                />
-              ))
-            }
-          </div>
+          {loading ? (
+            <div className="flex items-center justify-center py-20">
+              <div className="w-5 h-5 border-2 border-[#00E5CC]/30 border-t-[#00E5CC] rounded-full animate-spin" />
+            </div>
+          ) : (
+            <div
+              className={`
+                grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4
+                transition-all duration-200
+                ${gridVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-1'}
+              `}
+            >
+              {filteredFounders.length === 0
+                ? <EmptyState onSubmit={() => setShowModal(true)} />
+                : filteredFounders.map(f => (
+                  <FounderCard
+                    key={f.id}
+                    founder={f}
+                    activeTool={activeTool}
+                    onToolClick={handleToolClick}
+                    onDelete={handleDelete}
+                  />
+                ))
+              }
+            </div>
+          )}
         </main>
       </div>
 
